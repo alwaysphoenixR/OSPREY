@@ -1,0 +1,60 @@
+# ==========================================
+# Environment variables and secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ==========================================
+# Dependencies
+# ==========================================
+node_modules/
+
+# ==========================================
+# Build output
+# ==========================================
+dist/
+build/
+out/
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# ==========================================
+# Logs
+# ==========================================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ==========================================
+# Local databases and storage
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+qdrant_storage/
+
+# ==========================================
+# Test coverage and temporary files
+# ==========================================
+coverage/
+.nyc_output/
+.tmp/
+temp/
+
+# ==========================================
+# Editor and operating system files
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

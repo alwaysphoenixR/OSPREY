@@ -1,0 +1,384 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ======================================================
+// PART 1: ENUMS
+// ======================================================
+
+enum McpTransportType {
+  STDIO
+  STREAMABLE_HTTP
+  SSE
+}
+
+enum SideEffectClass {
+  READ_ONLY
+  REVERSIBLE
+  IRREVERSIBLE
+}
+
+enum ToolApprovalStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum SessionStatus {
+  IN_PROGRESS
+  ROLLING_BACK
+  ROLLED_BACK
+  COMPLETED
+  FAILED
+  MANUAL_INTERVENTION_REQUIRED
+}
+
+enum NodeStatus {
+  PENDING_APPROVAL
+  READY
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+  OUTCOME_UNKNOWN
+  COMPENSATING
+  COMPENSATED
+  COMPENSATION_FAILED
+}
+
+enum AttemptStatus {
+  PREPARED
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+  OUTCOME_UNKNOWN
+}
+
+enum OutboxKind {
+  EXECUTE
+  RECONCILE
+  COMPENSATE
+}
+
+enum OutboxStatus {
+  HELD
+  READY
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum DeadLetterStatus {
+  UNRESOLVED
+  RESOLVED_RETRY
+  RESOLVED_FORCE
+  RESOLVED_CANCELLED
+}
+
+// ======================================================
+// PART 2: MCP SERVER REGISTRY
+// ======================================================
+
+model McpServer {
+  id            String          @id @default(uuid())
+  serverKey     String          @unique
+  displayName   String
+  transportType McpTransportType
+
+  endpointUrl   String?
+  command       String?
+  args          String[]        @default([])
+
+  // Reference to a secret manager or secure configuration.
+  // Do not store raw OAuth tokens or API secrets here.
+  authRef       String?
+
+  isEnabled     Boolean         @default(true)
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  tools         ToolDefinition[]
+
+  @@map("mcp_servers")
+}
+
+// ======================================================
+// PART 3: TOOL DEFINITIONS AND VERSIONS
+// ======================================================
+
+model ToolDefinition {
+  id           String   @id @default(uuid())
+  serverId     String
+
+  upstreamName String
+  ospreyName   String   @unique
+  description  String
+
+  isEnabled    Boolean  @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  server       McpServer @relation(fields: [serverId], references: [id], onDelete: Restrict)
+
+  versions     ToolVersion[]
+
+  @@unique([serverId, upstreamName])
+  @@map("tool_definitions")
+}
+
+model ToolVersion {
+  id               String   @id @default(uuid())
+  toolDefId        String
+
+  versionNumber    Int
+  inputJsonSchema  Json
+  outputJsonSchema Json?
+  annotations      Json?
+  canonicalHash    String
+
+  discoveredAt     DateTime @default(now())
+
+  toolDefinition   ToolDefinition @relation(fields: [toolDefId], references: [id], onDelete: Restrict)
+
+  approval         ToolApproval?
+  dagNodes         DagNode[]
+
+  @@unique([toolDefId, versionNumber])
+  @@unique([toolDefId, canonicalHash])
+  @@map("tool_versions")
+}
+
+// ======================================================
+// PART 4: VERSION-SPECIFIC TOOL APPROVAL
+// ======================================================
+
+model ToolApproval {
+  id                 String             @id @default(uuid())
+  toolVersionId      String             @unique
+
+  status             ToolApprovalStatus @default(PENDING_REVIEW)
+  sideEffectClass    SideEffectClass
+  requiresHumanAuth  Boolean            @default(false)
+
+  // Declarative compensation and reconciliation configuration.
+  compensatingTool   String?
+  compensationMap    Json?
+  reconciliationTool String?
+
+  approvedBy         String?
+  approvedAt         DateTime?
+  reviewNotes        String?
+
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  toolVersion        ToolVersion @relation(fields: [toolVersionId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@map("tool_approvals")
+}
+
+// ======================================================
+// PART 5: WORKFLOW SESSIONS
+// ======================================================
+
+model WorkflowSession {
+  sessionId           String        @id @default(uuid()) @map("session_id")
+
+  // Authenticated user, agent, or service that owns this workflow.
+  principalId         String
+  tenantId            String?
+
+  status              SessionStatus @default(IN_PROGRESS)
+
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  rollbackStartedAt   DateTime?
+  rollbackCompletedAt DateTime?
+
+  dagNodes            DagNode[]
+  outboxItems         EffectOutbox[]
+  deadLetters         DeadLetterQueue[]
+
+  @@index([principalId, createdAt])
+  @@index([status, updatedAt])
+  @@map("workflow_sessions")
+}
+
+// ======================================================
+// PART 6: DAG NODES AND IDEMPOTENCY
+// ======================================================
+
+model DagNode {
+  nodeId              String          @id @default(uuid()) @map("node_id")
+  sessionId           String          @map("session_id")
+  toolVersionId       String
+
+  // Snapshot of the OSPREY-facing name used for this execution.
+  ospreyToolName      String
+
+  requestPayload      Json
+  responsePayload     Json?
+
+  status              NodeStatus      @default(READY)
+
+  // Scope identifies the caller/tenant namespace for the key.
+  idempotencyScope    String
+  idempotencyKey      String
+  requestFingerprint  String
+
+  // Snapshot of the approved risk classification at execution time.
+  sideEffectClass     SideEffectClass
+
+  // Useful for ordering, but explicit dependency edges define the DAG.
+  executionOrder      Int             @default(0)
+
+  latencyMs           Int?
+  providerOperationId String?
+  lastError           String?
+
+  startedAt           DateTime?
+  completedAt         DateTime?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  session             WorkflowSession @relation(fields: [sessionId], references: [sessionId], onDelete: Restrict)
+
+  toolVersion         ToolVersion @relation(fields: [toolVersionId], references: [id], onDelete: Restrict)
+
+  attempts            ExecutionAttempt[]
+  outboxItems         EffectOutbox[]
+  deadLetters         DeadLetterQueue[]
+
+  dependencies        DagDependency[] @relation("NodeDependencies")
+  dependents          DagDependency[] @relation("NodeDependents")
+
+  // The same scoped key cannot create two logical operations.
+  @@unique([idempotencyScope, idempotencyKey])
+
+  @@index([sessionId, status])
+  @@index([toolVersionId])
+  @@map("dag_nodes")
+}
+
+// ======================================================
+// PART 7: DAG DEPENDENCIES
+// ======================================================
+
+model DagDependency {
+  id          String  @id @default(uuid())
+  fromNodeId  String
+  toNodeId    String
+
+  // fromNode must finish as required before toNode can proceed.
+  fromNode    DagNode @relation("NodeDependencies", fields: [fromNodeId], references: [nodeId], onDelete: Restrict)
+
+  toNode      DagNode @relation("NodeDependents", fields: [toNodeId], references: [nodeId], onDelete: Restrict)
+
+  @@unique([fromNodeId, toNodeId])
+  @@index([toNodeId])
+  @@map("dag_dependencies")
+}
+
+// ======================================================
+// PART 8: EXECUTION ATTEMPTS
+// ======================================================
+
+model ExecutionAttempt {
+  id                     String        @id @default(uuid())
+  nodeId                 String
+  attemptNumber          Int
+
+  status                 AttemptStatus @default(PREPARED)
+
+  // Use a provider key only if the provider supports it.
+  providerIdempotencyKey String?
+  providerRequestId      String?
+
+  responsePayload        Json?
+  errorCode              String?
+  errorMessage           String?
+
+  startedAt              DateTime?
+  completedAt            DateTime?
+  createdAt              DateTime      @default(now())
+
+  node                   DagNode @relation(fields: [nodeId], references: [nodeId], onDelete: Restrict)
+
+  @@unique([nodeId, attemptNumber])
+  @@index([status, createdAt])
+  @@map("execution_attempts")
+}
+
+// ======================================================
+// PART 9: TRANSACTIONAL OUTBOX
+// ======================================================
+
+model EffectOutbox {
+  outboxId      String      @id @default(uuid()) @map("outbox_id")
+  sessionId     String      @map("session_id")
+  nodeId        String
+
+  kind          OutboxKind
+  status        OutboxStatus @default(HELD)
+
+  // Optional action-specific metadata, not a secret store.
+  payload       Json?
+
+  attemptCount  Int         @default(0)
+  availableAt   DateTime    @default(now())
+  lockedAt      DateTime?
+  processedAt   DateTime?
+  lastError     String?
+
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  session       WorkflowSession @relation(fields: [sessionId], references: [sessionId], onDelete: Restrict)
+
+  node          DagNode @relation(fields: [nodeId], references: [nodeId], onDelete: Restrict)
+
+  @@index([status, availableAt])
+  @@index([sessionId])
+  @@index([nodeId, kind])
+  @@map("effect_outbox")
+}
+
+// ======================================================
+// PART 10: DEAD-LETTER QUEUE
+// ======================================================
+
+model DeadLetterQueue {
+  id              String           @id @default(uuid())
+  sessionId       String           @map("session_id")
+  nodeId          String?          @map("node_id")
+
+  failedAction    String
+  errorReason     String
+  retryCount      Int              @default(0)
+
+  status          DeadLetterStatus @default(UNRESOLVED)
+
+  resolutionNote  String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  resolvedAt      DateTime?
+
+  session         WorkflowSession @relation(fields: [sessionId], references: [sessionId], onDelete: Restrict)
+
+  node            DagNode? @relation(fields: [nodeId], references: [nodeId], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([sessionId])
+  @@map("dead_letter_queue")
+}
