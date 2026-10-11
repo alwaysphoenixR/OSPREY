@@ -1,4 +1,3 @@
-// src/discovery/approver.ts
 import {
   PrismaClient,
   SideEffectClass,
@@ -6,21 +5,10 @@ import {
   Prisma,
 } from "@prisma/client";
 
+import type { CompensationMap } from "../types/compensation.js";
+import { validateCompensationMap } from "../utils/json-pointer.js";
+
 const prisma = new PrismaClient();
-
-/**
- * Strict declarative mapping for RFC 6901 JSON Pointers.
- * Example:
- * {
- *   "booking_id": { "from": "response", "pointer": "/booking_id" }
- * }
- */
-export interface CompensationFieldPointer {
-  from: "request" | "response";
-  pointer: string; // Must be a valid RFC 6901 JSON pointer starting with '/'
-}
-
-export type CompensationMap = Record<string, CompensationFieldPointer>;
 
 export interface SafetyContractInput {
   ospreyName: string;
@@ -35,37 +23,14 @@ export interface SafetyContractInput {
 }
 
 /**
- * Validates that a compensation map adheres strictly to RFC 6901 JSON Pointer syntax
- * and only references 'request' or 'response' sources.
- */
-function validateCompensationMap(map: CompensationMap): void {
-  const entries = Object.entries(map);
-  if (entries.length === 0) {
-    throw new Error(
-      "compensationMap cannot be an empty object for a REVERSIBLE tool.",
-    );
-  }
-
-  for (const [targetField, rule] of entries) {
-    if (!targetField || typeof targetField !== "string") {
-      throw new Error("Invalid target field name in compensationMap.");
-    }
-    if (rule.from !== "request" && rule.from !== "response") {
-      throw new Error(
-        `Invalid source "${rule.from}" for field "${targetField}". Must be "request" or "response".`,
-      );
-    }
-    if (typeof rule.pointer !== "string" || !rule.pointer.startsWith("/")) {
-      throw new Error(
-        `Invalid RFC 6901 pointer "${rule.pointer}" for field "${targetField}". Pointers must start with "/".`,
-      );
-    }
-  }
-}
-
-/**
- * Promotes a specific ToolVersion from PENDING_REVIEW to APPROVED
- * after validating its safety and compensation contract.
+ * Approves a specific ToolVersion after validating its safety contract.
+ *
+ * IMPORTANT:
+ * This version validates compensation-map structure and verifies that
+ * referenced compensating/reconciliation tools exist in the registry.
+ *
+ * Exact compensating-version approval checks and safe approval-state
+ * transition enforcement remain planned hardening work.
  */
 export async function approveToolVersion(input: SafetyContractInput) {
   const {
@@ -80,7 +45,7 @@ export async function approveToolVersion(input: SafetyContractInput) {
     reviewNotes,
   } = input;
 
-  // 1. Resolve the exact ToolDefinition and pinned ToolVersion
+  // 1. Resolve the exact ToolDefinition and ToolVersion.
   const toolDef = await prisma.toolDefinition.findUnique({
     where: { ospreyName },
     include: {
@@ -96,32 +61,36 @@ export async function approveToolVersion(input: SafetyContractInput) {
   }
 
   const toolVersion = toolDef.versions[0];
+
   if (!toolVersion) {
     throw new Error(
       `Version ${versionNumber} for tool "${ospreyName}" does not exist.`,
     );
   }
 
-  // 2. Enforce strict contract rules for REVERSIBLE operations
+  // 2. Validate contracts for REVERSIBLE operations.
   if (sideEffectClass === SideEffectClass.REVERSIBLE) {
     if (!compensatingTool) {
       throw new Error(
         `Tool "${ospreyName}" v${versionNumber} is marked REVERSIBLE and must specify a compensatingTool.`,
       );
     }
+
     if (!compensationMap) {
       throw new Error(
         `Tool "${ospreyName}" v${versionNumber} is marked REVERSIBLE and must specify a compensationMap.`,
       );
     }
 
-    // Validate RFC 6901 pointer syntax
+    // Use the shared runtime validator.
     validateCompensationMap(compensationMap);
 
-    // Ensure the compensating tool exists in OSPREY's registry
+    // Verify that the compensating tool exists in the registry.
+    // Checking its exact approved version is deferred to the hardening pass.
     const compToolDef = await prisma.toolDefinition.findUnique({
       where: { ospreyName: compensatingTool },
     });
+
     if (!compToolDef) {
       throw new Error(
         `Compensating tool "${compensatingTool}" was not found in the ToolDefinition registry.`,
@@ -129,11 +98,12 @@ export async function approveToolVersion(input: SafetyContractInput) {
     }
   }
 
-  // 3. Verify reconciliation tool exists if specified
+  // 3. Verify the reconciliation tool exists, if specified.
   if (reconciliationTool) {
     const reconToolDef = await prisma.toolDefinition.findUnique({
       where: { ospreyName: reconciliationTool },
     });
+
     if (!reconToolDef) {
       throw new Error(
         `Reconciliation tool "${reconciliationTool}" was not found in the ToolDefinition registry.`,
@@ -141,35 +111,28 @@ export async function approveToolVersion(input: SafetyContractInput) {
     }
   }
 
-  // 4. Upsert and lock in the APPROVED contract for this specific ToolVersion
+  // 4. Persist the approval for this exact ToolVersion.
+  // NOTE: The current upsert can reapprove a suspended version.
+  // Safe transition enforcement is intentionally deferred.
+  const approvalData = {
+    status: ToolApprovalStatus.APPROVED,
+    sideEffectClass,
+    requiresHumanAuth,
+    compensatingTool: compensatingTool ?? null,
+    compensationMap:
+      (compensationMap as unknown as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+    reconciliationTool: reconciliationTool ?? null,
+    approvedBy,
+    approvedAt: new Date(),
+    reviewNotes: reviewNotes ?? "Approved via Safety Contract Service.",
+  };
+
   const approval = await prisma.toolApproval.upsert({
     where: { toolVersionId: toolVersion.id },
-    update: {
-      status: ToolApprovalStatus.APPROVED,
-      sideEffectClass,
-      requiresHumanAuth,
-      compensatingTool: compensatingTool ?? null,
-      compensationMap:
-        (compensationMap as unknown as Prisma.InputJsonValue) ??
-        Prisma.JsonNull,
-      reconciliationTool: reconciliationTool ?? null,
-      approvedBy,
-      approvedAt: new Date(),
-      reviewNotes: reviewNotes ?? "Approved via Safety Contract Service.",
-    },
+    update: approvalData,
     create: {
       toolVersionId: toolVersion.id,
-      status: ToolApprovalStatus.APPROVED,
-      sideEffectClass,
-      requiresHumanAuth,
-      compensatingTool: compensatingTool ?? null,
-      compensationMap:
-        (compensationMap as unknown as Prisma.InputJsonValue) ??
-        Prisma.JsonNull,
-      reconciliationTool: reconciliationTool ?? null,
-      approvedBy,
-      approvedAt: new Date(),
-      reviewNotes: reviewNotes ?? "Approved via Safety Contract Service.",
+      ...approvalData,
     },
   });
 
@@ -181,7 +144,7 @@ export async function approveToolVersion(input: SafetyContractInput) {
 }
 
 /**
- * Emergency kill-switch to suspend an approved ToolVersion immediately.
+ * Emergency kill-switch to suspend a specific ToolVersion.
  */
 export async function suspendToolVersion(
   ospreyName: string,
@@ -198,13 +161,14 @@ export async function suspendToolVersion(
   });
 
   const toolVersion = toolDef?.versions[0];
+
   if (!toolVersion) {
     throw new Error(
       `Cannot suspend: ${ospreyName} v${versionNumber} not found.`,
     );
   }
 
-  return await prisma.toolApproval.update({
+  return prisma.toolApproval.update({
     where: { toolVersionId: toolVersion.id },
     data: {
       status: ToolApprovalStatus.SUSPENDED,
