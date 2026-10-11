@@ -87,23 +87,25 @@ enum DeadLetterStatus {
 // ======================================================
 
 model McpServer {
-  id            String          @id @default(uuid())
-  serverKey     String          @unique
+  id            String           @id @default(uuid())
+  serverKey     String           @unique
   displayName   String
   transportType McpTransportType
 
   endpointUrl   String?
   command       String?
-  args          String[]        @default([])
+  args          String[]         @default([])
 
   // Reference to a secret manager or secure configuration.
-  // Do not store raw OAuth tokens or API secrets here.
   authRef       String?
 
-  isEnabled     Boolean         @default(true)
+  isEnabled     Boolean          @default(true)
 
-  createdAt     DateTime        @default(now())
-  updatedAt     DateTime        @updatedAt
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  
+  // Track exactly when the discovery worker last successfully polled this server
+  lastDiscoveredAt DateTime?
 
   tools         ToolDefinition[]
 
